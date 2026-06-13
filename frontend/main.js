@@ -6,22 +6,34 @@ const WS_URL = "ws://localhost:8080/ws";
 // ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
-const DOME_MARGIN = 0.92;     // fraction of the half-viewport the dome fills
-const LERP = 0.08;            // per-frame easing toward target position
-const TRAIL_MAX = 48;         // points kept per trail
-const TRAIL_EVERY = 5;        // append to trails every N frames
+const DOME_MARGIN = 0.92;      // fraction of the half-viewport the dome fills
+
+// Dead reckoning.
+const MIN_DT = 1.0;            // ignore velocity from sub-second frame gaps
+const VEL_CLAMP = 6.0;         // max |velocity| in deg/s (guards bad data)
+const MISSING_SECONDS = 30;    // start fading after this long with no update
+const FADE_SECONDS = 2;        // fade-out duration before removal
+
+// Trails (sampled extrapolated positions).
+const TRAIL_SAMPLE_MS = 400;
+const PLANE_TRAIL = 8;
+const SAT_TRAIL = 12;
+
+// Labels.
+const LABEL_MIN_GAP = 20;      // hide a label whose center is within this many px
+const SAT_LABEL_MIN_ALT = 15;  // only label satellites above this altitude
+
+// Marker sizes.
+const SAT_DOT = 8;
+const ISS_DOT = 12;
 
 const COLORS = {
-  sat: new THREE.Color(0xc6ccd6),   // dim white/grey
-  plane: new THREE.Color(0xffa31a), // amber
-  iss: new THREE.Color(0xffd24a),   // gold
+  sat: new THREE.Color(0xaaaacc),   // dim blue-white
+  plane: new THREE.Color(0xffa040), // amber
+  iss: new THREE.Color(0xffd700),   // gold
 };
 
-const SIZES = {
-  sat: 7,
-  plane: 9,
-  iss: 12,
-};
+const PRIORITY = { iss: 3, plane: 2, sat: 1 };
 
 // ---------------------------------------------------------------------------
 // Scene / camera / renderer
@@ -66,8 +78,20 @@ function worldPos(az, alt) {
   return { x: c.x, y: -c.y };
 }
 
+// Shortest signed angular delta b-a, in [-180, 180].
+function angularDelta(a, b) {
+  let d = (b - a) % 360;
+  if (d > 180) d -= 360;
+  if (d < -180) d += 360;
+  return d;
+}
+
+function clampVel(v) {
+  return Math.max(-VEL_CLAMP, Math.min(VEL_CLAMP, v));
+}
+
 // ---------------------------------------------------------------------------
-// Shared textures / helpers
+// Shared textures / marker + label factories
 // ---------------------------------------------------------------------------
 const glowTexture = makeGlowTexture();
 
@@ -90,6 +114,7 @@ function makeGlowTexture() {
   return tex;
 }
 
+// Plain text sprite (used for the static cardinal labels).
 function makeTextSprite(text, color, fontSize = 44) {
   const canvas = document.createElement("canvas");
   canvas.width = 256;
@@ -112,6 +137,39 @@ function makeTextSprite(text, color, fontSize = 44) {
   return sprite;
 }
 
+// Object label sized so the rendered glyph height is ~pxHeight on screen.
+function makeLabel(text, color, pxHeight) {
+  const fontPx = 64; // render hi-res, scale down for crispness
+  const pad = 6;
+  const measure = document.createElement("canvas").getContext("2d");
+  measure.font = `600 ${fontPx}px -apple-system, Helvetica, Arial, sans-serif`;
+  const textW = Math.ceil(measure.measureText(text).width);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = textW + pad * 2;
+  canvas.height = Math.ceil(fontPx * 1.4);
+  const ctx = canvas.getContext("2d");
+  ctx.font = `600 ${fontPx}px -apple-system, Helvetica, Arial, sans-serif`;
+  ctx.fillStyle = color;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.minFilter = THREE.LinearFilter;
+  const mat = new THREE.SpriteMaterial({
+    map: tex,
+    transparent: true,
+    depthTest: false,
+  });
+  const sprite = new THREE.Sprite(mat);
+  // Canvas height maps to pxHeight*1.4 on screen, so the glyph is ~pxHeight.
+  const screenH = pxHeight * 1.4;
+  sprite.scale.set((screenH * canvas.width) / canvas.height, screenH, 1);
+  return sprite;
+}
+
+// Glowing dot (satellites / ISS).
 function makeDot(color, size, opacity) {
   const mat = new THREE.SpriteMaterial({
     map: glowTexture,
@@ -124,6 +182,24 @@ function makeDot(color, size, opacity) {
   const sprite = new THREE.Sprite(mat);
   sprite.scale.set(size, size, 1);
   return sprite;
+}
+
+// Chevron / arrowhead pointing +y (North); rotated per-frame to its heading.
+function makeChevron(color) {
+  const shape = new THREE.Shape();
+  shape.moveTo(0, 9);    // tip
+  shape.lineTo(7, -7);   // right wing
+  shape.lineTo(0, -3);   // inner notch
+  shape.lineTo(-7, -7);  // left wing
+  shape.closePath();
+  const geo = new THREE.ShapeGeometry(shape);
+  const mat = new THREE.MeshBasicMaterial({
+    color: color,
+    transparent: true,
+    opacity: 0.9,
+    depthTest: false,
+  });
+  return new THREE.Mesh(geo, mat);
 }
 
 // ---------------------------------------------------------------------------
@@ -180,29 +256,58 @@ function buildDome() {
 buildDome();
 
 // ---------------------------------------------------------------------------
+// Legend (bottom-left DOM overlay)
+// ---------------------------------------------------------------------------
+function buildLegend() {
+  const el = document.createElement("div");
+  el.style.cssText = [
+    "position:fixed",
+    "left:14px",
+    "bottom:12px",
+    "font:11px -apple-system, Helvetica, Arial, sans-serif",
+    "line-height:1.55",
+    "opacity:0.7",
+    "pointer-events:none",
+    "user-select:none",
+  ].join(";");
+  el.innerHTML =
+    '<div style="color:#AAAACC">● satellites</div>' +
+    '<div style="color:#FFA040">▶ planes</div>' +
+    '<div style="color:#FFD700">● ISS</div>';
+  document.body.appendChild(el);
+}
+
+buildLegend();
+
+// ---------------------------------------------------------------------------
 // Tracked objects
 // ---------------------------------------------------------------------------
 const tracked = new Map(); // id -> record
-let frame = 0;
 
-function makeRecord(data) {
+function makeRecord(data, now) {
   const isISS = data.id === "ISS";
   const type = isISS ? "iss" : data.type === "plane" ? "plane" : "sat";
   const color = COLORS[type];
-  const baseOpacity = type === "sat" ? 0.55 : type === "plane" ? 0.9 : 1.0;
-  const opacity =
-    type === "sat" && typeof data.bright === "number"
-      ? Math.max(0.25, Math.min(1, data.bright)) * baseOpacity
-      : baseOpacity;
 
-  const dot = makeDot(color, SIZES[type], opacity);
-  dot.renderOrder = 3;
-  scene.add(dot);
+  // Marker.
+  let marker;
+  let baseOpacity = 1;
+  let trailLen;
+  if (type === "plane") {
+    marker = makeChevron(color);
+    trailLen = PLANE_TRAIL;
+  } else {
+    baseOpacity = isISS ? 1.0 : 0.9;
+    marker = makeDot(color, isISS ? ISS_DOT : SAT_DOT, baseOpacity);
+    trailLen = SAT_TRAIL;
+  }
+  marker.renderOrder = 3;
+  scene.add(marker);
 
   // Trail line (vertex colors fade to black = invisible on black bg).
   const trailGeo = new THREE.BufferGeometry();
-  trailGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(TRAIL_MAX * 3), 3));
-  trailGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(TRAIL_MAX * 3), 3));
+  trailGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(trailLen * 3), 3));
+  trailGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(trailLen * 3), 3));
   const trailMat = new THREE.LineBasicMaterial({
     vertexColors: true,
     transparent: true,
@@ -214,61 +319,61 @@ function makeRecord(data) {
   trailLine.frustumCulled = false;
   scene.add(trailLine);
 
-  // Heading line for planes.
-  let headingLine = null;
-  if (type === "plane") {
-    const hGeo = new THREE.BufferGeometry();
-    hGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
-    const hMat = new THREE.LineBasicMaterial({
-      color: color,
-      transparent: true,
-      opacity: 0.75,
-      depthTest: false,
-    });
-    headingLine = new THREE.Line(hGeo, hMat);
-    headingLine.renderOrder = 2;
-    headingLine.frustumCulled = false;
-    scene.add(headingLine);
-  }
-
-  // Floating "ISS" label.
+  // Label.
   let label = null;
-  if (isISS) {
-    label = makeTextSprite("ISS", "rgba(255,210,74,0.95)", 40);
+  if (type === "plane") {
+    const cs = (data.callsign || "").trim();
+    if (cs) label = makeLabel(cs, "rgba(255,255,255,0.7)", 10);
+  } else if (isISS) {
+    label = makeLabel("ISS", "rgba(255,215,0,0.95)", 11);
+  } else {
+    const name = (data.name || data.id || "").trim();
+    if (name) label = makeLabel(name, "rgba(200,205,225,0.6)", 9);
+  }
+  if (label) {
     label.renderOrder = 4;
     scene.add(label);
   }
 
-  const start = worldPos(data.az, data.alt);
   return {
     id: data.id,
     type,
     isISS,
     color,
+    priority: PRIORITY[type],
+    // Dead-reckoning state.
     az: data.az,
     alt: data.alt,
-    data,
-    current: { x: start.x, y: start.y },
+    dAz: 0,
+    dAlt: 0,
+    lastUpdated: now, // anchor time: advanced only when position changes
+    lastSeen: now,    // any appearance in a frame; drives the 30s expiry
+    heading: typeof data.heading === "number" ? data.heading : null,
+    callsign: data.callsign,
+    name: data.name,
+    bright: data.bright,
+    // Render state.
+    curAlt: data.alt,
+    pos: worldPos(data.az, data.alt),
     trail: [],
-    dot,
+    trailLen,
+    lastTrailSample: now,
+    marker,
     trailLine,
-    headingLine,
     label,
-    seen: true,
+    baseOpacity,
   };
 }
 
 function disposeRecord(rec) {
-  scene.remove(rec.dot);
-  rec.dot.material.dispose();
+  scene.remove(rec.marker);
+  if (rec.type === "plane" && rec.marker.geometry) rec.marker.geometry.dispose();
+  rec.marker.material.dispose();
+
   scene.remove(rec.trailLine);
   rec.trailLine.geometry.dispose();
   rec.trailLine.material.dispose();
-  if (rec.headingLine) {
-    scene.remove(rec.headingLine);
-    rec.headingLine.geometry.dispose();
-    rec.headingLine.material.dispose();
-  }
+
   if (rec.label) {
     scene.remove(rec.label);
     rec.label.material.map.dispose();
@@ -299,29 +404,38 @@ function connect() {
 }
 
 function handleMessage(msg) {
+  const now = performance.now();
   const objects = msg.objects || [];
-  for (const rec of tracked.values()) rec.seen = false;
 
   for (const data of objects) {
     if (!data.id) continue;
     let rec = tracked.get(data.id);
     if (!rec) {
-      rec = makeRecord(data);
-      tracked.set(data.id, rec);
-    } else {
-      rec.az = data.az;
-      rec.alt = data.alt;
-      rec.data = data;
+      tracked.set(data.id, makeRecord(data, now));
+      continue;
     }
-    rec.seen = true;
-  }
 
-  // Drop objects no longer reported.
-  for (const [id, rec] of tracked) {
-    if (!rec.seen) {
-      disposeRecord(rec);
-      tracked.delete(id);
+    rec.lastSeen = now; // keep it alive even on duplicate re-broadcasts
+    if (typeof data.heading === "number") rec.heading = data.heading;
+    rec.callsign = data.callsign;
+    rec.name = data.name;
+    rec.bright = data.bright;
+
+    // The backend re-broadcasts unchanged OpenSky data (5s push vs 10s poll),
+    // so only treat a genuinely new position as a velocity sample / anchor.
+    // Duplicates leave the extrapolation running off the last real velocity.
+    if (data.az === rec.az && data.alt === rec.alt) continue;
+
+    const dt = (now - rec.lastUpdated) / 1000;
+    if (dt >= MIN_DT) {
+      rec.dAz = clampVel(angularDelta(rec.az, data.az) / dt);
+      rec.dAlt = clampVel((data.alt - rec.alt) / dt);
     }
+    rec.az = data.az;
+    rec.alt = data.alt;
+    rec.lastUpdated = now;
+    // Do NOT snap the rendered position; the extrapolation loop handles it,
+    // which keeps motion continuous when corrections arrive.
   }
 }
 
@@ -330,7 +444,7 @@ connect();
 // ---------------------------------------------------------------------------
 // Animation
 // ---------------------------------------------------------------------------
-function updateTrail(rec) {
+function updateTrail(rec, fade) {
   const n = rec.trail.length;
   const posAttr = rec.trailLine.geometry.attributes.position;
   const colAttr = rec.trailLine.geometry.attributes.color;
@@ -349,66 +463,122 @@ function updateTrail(rec) {
   rec.trailLine.geometry.setDrawRange(0, n);
   posAttr.needsUpdate = true;
   colAttr.needsUpdate = true;
+  rec.trailLine.material.opacity = 0.7 * fade;
 }
 
-function updateHeading(rec) {
-  const data = rec.data;
-  if (typeof data.heading !== "number") {
-    rec.headingLine.visible = false;
-    return;
+// Resolve label visibility: higher-priority labels claim their spot first;
+// a lower-priority label within LABEL_MIN_GAP px of one already placed is hidden.
+function resolveLabels(now) {
+  const candidates = [];
+  for (const rec of tracked.values()) {
+    if (!rec.label) continue;
+    rec.label.visible = false;
+    let show;
+    if (rec.type === "plane" || rec.isISS) show = true;
+    else show = rec.curAlt > SAT_LABEL_MIN_ALT;
+    if (show) candidates.push(rec);
   }
-  rec.headingLine.visible = true;
-  const len = 18;
-  const h = (data.heading * Math.PI) / 180;
-  // North = up (+y), East = right (+x), matching the dome's screen layout.
-  const dx = Math.sin(h) * len;
-  const dy = Math.cos(h) * len;
-  const arr = rec.headingLine.geometry.attributes.position.array;
-  arr[0] = rec.current.x;
-  arr[1] = rec.current.y;
-  arr[2] = 0;
-  arr[3] = rec.current.x + dx;
-  arr[4] = rec.current.y + dy;
-  arr[5] = 0;
-  rec.headingLine.geometry.attributes.position.needsUpdate = true;
+  candidates.sort((a, b) => b.priority - a.priority);
+
+  const placed = [];
+  const gapSq = LABEL_MIN_GAP * LABEL_MIN_GAP;
+  for (const rec of candidates) {
+    const off = rec.type === "sat" ? 12 : 16;
+    const lx = rec.pos.x;
+    const ly = rec.pos.y + off;
+
+    let ok = true;
+    for (const pl of placed) {
+      const dx = lx - pl.x;
+      const dy = ly - pl.y;
+      if (dx * dx + dy * dy < gapSq) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+
+    const sinceSeen = (now - rec.lastSeen) / 1000;
+    const fade =
+      sinceSeen > MISSING_SECONDS
+        ? Math.max(0, 1 - (sinceSeen - MISSING_SECONDS) / FADE_SECONDS)
+        : 1;
+    rec.label.visible = true;
+    rec.label.position.set(lx, ly, 0);
+    rec.label.material.opacity = fade;
+    placed.push({ x: lx, y: ly });
+  }
 }
 
 function animate() {
   requestAnimationFrame(animate);
-  frame++;
-  const pushTrail = frame % TRAIL_EVERY === 0;
+  const now = performance.now();
 
+  const expired = [];
   for (const rec of tracked.values()) {
-    const target = worldPos(rec.az, rec.alt);
-    rec.current.x += (target.x - rec.current.x) * LERP;
-    rec.current.y += (target.y - rec.current.y) * LERP;
-
-    rec.dot.position.set(rec.current.x, rec.current.y, 0);
-
-    if (pushTrail) {
-      rec.trail.push({ x: rec.current.x, y: rec.current.y });
-      if (rec.trail.length > TRAIL_MAX) rec.trail.shift();
+    // Fade out and expire objects missing (not re-broadcast) for too long.
+    const sinceSeen = (now - rec.lastSeen) / 1000;
+    let fade = 1;
+    if (sinceSeen > MISSING_SECONDS) {
+      fade = 1 - (sinceSeen - MISSING_SECONDS) / FADE_SECONDS;
+      if (fade <= 0) {
+        expired.push(rec.id);
+        continue;
+      }
     }
-    updateTrail(rec);
 
-    if (rec.headingLine) updateHeading(rec);
+    // Dead reckoning: extrapolate from the last real position anchor.
+    const elapsed = (now - rec.lastUpdated) / 1000;
+    const curAz = rec.az + rec.dAz * elapsed;
+    const curAlt = Math.max(0, Math.min(90, rec.alt + rec.dAlt * elapsed));
+    rec.curAlt = curAlt;
+    const p = worldPos(curAz, curAlt);
+    rec.pos.x = p.x;
+    rec.pos.y = p.y;
+    rec.marker.position.set(p.x, p.y, 0);
 
-    if (rec.label) {
-      rec.label.position.set(rec.current.x, rec.current.y + 22, 0);
+    if (rec.type === "plane") {
+      // Point the chevron along its heading; +y shape, screen North = +y.
+      if (typeof rec.heading === "number") {
+        rec.marker.rotation.z = -(rec.heading * Math.PI) / 180;
+      }
+      // Altitude hint: lower toward the horizon = more transparent.
+      const altOpacity = Math.max(0.25, Math.min(1, 0.25 + 0.75 * (curAlt / 60)));
+      rec.marker.material.opacity = altOpacity * fade;
+    } else {
+      rec.marker.material.opacity = rec.baseOpacity * fade;
     }
+
+    // Sample the extrapolated position into the trail.
+    if (now - rec.lastTrailSample >= TRAIL_SAMPLE_MS) {
+      rec.trail.push({ x: p.x, y: p.y });
+      if (rec.trail.length > rec.trailLen) rec.trail.shift();
+      rec.lastTrailSample = now;
+    }
+    updateTrail(rec, fade);
   }
 
+  for (const id of expired) {
+    disposeRecord(tracked.get(id));
+    tracked.delete(id);
+  }
+
+  resolveLabels(now);
   renderer.render(scene, camera);
 }
 
 animate();
 
 // Debug hook: inspect live state from the browser console, e.g.
-// `skyTracker.stats()` or `skyTracker.tracked`.
+// `skyTracker.stats()`, `skyTracker.tracked`, or feed synthetic objects with
+// `skyTracker.simulate([{ id: "ISS", type: "sat", az: 120, alt: 60, name: "ISS (ZARYA)" }])`.
 window.skyTracker = {
   tracked,
   scene,
   renderer,
+  simulate(objects) {
+    handleMessage({ objects: objects || [] });
+  },
   stats() {
     let sat = 0, plane = 0, iss = 0;
     for (const r of tracked.values()) {
