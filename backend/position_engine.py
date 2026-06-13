@@ -12,6 +12,8 @@ import math
 
 from skyfield.api import EarthSatellite, load, wgs84
 
+import route_cache
+
 # Observer location (Chicago).
 OBS_LAT = 41.91734343314767
 OBS_LON = -87.63808451349306
@@ -138,17 +140,25 @@ def compute_plane_positions(plane_states):
         if alt <= PLANE_MIN_ALT_DEG:
             continue
 
-        objects.append(
-            {
-                "id": icao24 or callsign,
-                "type": "plane",
-                "az": round(az, 2),
-                "alt": round(alt, 2),
-                "speed": round(velocity * MS_TO_KNOTS) if velocity is not None else None,
-                "heading": round(heading, 1) if heading is not None else None,
-                "callsign": callsign or icao24,
-            }
-        )
+        obj = {
+            "id": icao24 or callsign,
+            "type": "plane",
+            "az": round(az, 2),
+            "alt": round(alt, 2),
+            "speed": round(velocity * MS_TO_KNOTS) if velocity is not None else None,
+            "heading": round(heading, 1) if heading is not None else None,
+            "callsign": callsign or icao24,
+        }
+
+        # Attach origin/destination IATA codes if the route is cached. Pure
+        # dict lookup, so this never blocks the WebSocket loop. Fields are
+        # omitted when unavailable; the frontend handles their absence.
+        route = route_cache.get_route(callsign)
+        if route and route.get("origin_iata") and route.get("destination_iata"):
+            obj["origin"] = route["origin_iata"]
+            obj["destination"] = route["destination_iata"]
+
+        objects.append(obj)
     return objects
 
 

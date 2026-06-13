@@ -13,6 +13,8 @@ import logging
 
 import httpx
 
+import route_cache
+
 log = logging.getLogger("sky-tracker.data_fetcher")
 
 # Celestrak's legacy /pub/TLE/visual.txt path now returns 403; the GP query API
@@ -71,6 +73,13 @@ async def _fetch_opensky(client: httpx.AsyncClient) -> None:
     states = data.get("states") or []
     plane_states = states
     log.info("Fetched %d aircraft from OpenSky", len(states))
+
+    # Kick off route lookups for any callsigns we haven't cached yet.
+    for s in states:
+        callsign = (s[1] or "").strip()
+        if callsign:
+            route_cache.ensure_route(callsign)
+
     opensky_ready.set()
 
 
