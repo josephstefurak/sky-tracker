@@ -1,7 +1,7 @@
 import * as THREE from "three";
 
 // One-line swap to wss://<cloud-run-host>/ws when this is deployed later.
-const WS_URL = "ws://localhost:8080/ws";
+const WS_URL = 'ws://192.168.1.65:8080/ws'; // use your actual IP
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -228,8 +228,8 @@ function makeRing(r, color, opacity, dashed) {
   const geo = new THREE.BufferGeometry().setFromPoints(pts);
   const mat = dashed
     ? new THREE.LineDashedMaterial({
-        color, transparent: true, opacity, dashSize: 6, gapSize: 6, depthTest: false,
-      })
+      color, transparent: true, opacity, dashSize: 6, gapSize: 6, depthTest: false,
+    })
     : new THREE.LineBasicMaterial({ color, transparent: true, opacity, depthTest: false });
   const line = new THREE.Line(geo, mat);
   if (dashed) line.computeLineDistances();
