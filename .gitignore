@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+backend/.venv/
+.venv/
+
+# Skyfield downloads (ephemeris/timescale cache)
+*.bsp
+*.dat
+finals2000A.all
+
+# OS
+.DS_Store
