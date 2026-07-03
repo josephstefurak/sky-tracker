@@ -17,3 +17,13 @@ body {
 canvas {
   display: block;
 }
+
+/* The dome canvas is absolutely centered inside the rotation container so it
+   pivots about the screen center even when the container's axes are swapped
+   for the 90°/270° orientations (the canvas itself stays window-sized). */
+.sky-rotator > canvas {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}

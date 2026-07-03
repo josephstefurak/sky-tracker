@@ -29,13 +29,31 @@
  *   ]);
  */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CLIENT_POLL_MS } from "@/lib/config";
 import type { SkyObject, SkyResponse } from "@/lib/types";
 import { SkyEngine } from "./sky/engine";
 import { Hud } from "./sky/hud";
 
 const FETCH_TIMEOUT_MS = 8_000;
+
+/**
+ * Screen rotation (projector physically fixed; the image must re-orient).
+ *
+ * A single CSS rotate on the container that holds the canvas AND the DOM
+ * overlays: the transform makes the container the containing block for the
+ * HUD's position:fixed elements, so footer, spotlight card and button all
+ * pivot with the scene as one rigid unit. Purely presentational — az/alt
+ * math, CEILING_MIRROR and the engine never see it.
+ *
+ * At 90°/270° the container's axes are swapped (100vh × 100vw, centered) so
+ * it still covers the viewport exactly and the corner overlays stay visible
+ * on a non-square screen; width/height animate together with the transform
+ * so the whole move is one smooth swing.
+ */
+const ROTATION_STORAGE_KEY = "sky-tracker:rotation";
+const ROTATION_TRANSITION =
+  "transform 350ms ease, width 350ms ease, height 350ms ease";
 
 /** fetch with a hard timeout (manual AbortController: AbortSignal.timeout and
  *  AbortSignal.any are missing from older Android WebViews). */
@@ -63,6 +81,33 @@ declare global {
 
 export default function SkyDome() {
   const hostRef = useRef<HTMLDivElement>(null);
+
+  // Cumulative clockwise angle. Kept monotonic (0, 90, 180, 270, 360, ...) so
+  // every press animates a further 90° clockwise instead of unwinding at the
+  // 270° → 0° wrap; localStorage holds angle % 360. `animate` stays false
+  // until the first press so the restored orientation applies instantly on
+  // load rather than as a spin.
+  const [rotation, setRotation] = useState({ angle: 0, animate: false });
+
+  useEffect(() => {
+    let stored = 0;
+    try {
+      stored = parseInt(localStorage.getItem(ROTATION_STORAGE_KEY) ?? "0", 10);
+    } catch {
+      // Storage unavailable (privacy mode) — keep the default orientation.
+    }
+    if (stored === 90 || stored === 180 || stored === 270) {
+      setRotation({ angle: stored, animate: false });
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ROTATION_STORAGE_KEY, String(rotation.angle % 360));
+    } catch {
+      // Best-effort persistence only.
+    }
+  }, [rotation.angle]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -158,5 +203,58 @@ export default function SkyDome() {
     };
   }, []);
 
-  return <div ref={hostRef} style={{ position: "fixed", inset: 0 }} />;
+  const orientation = ((rotation.angle % 360) + 360) % 360;
+  const swapped = orientation === 90 || orientation === 270;
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        overflow: "hidden",
+        background: "#000",
+      }}
+    >
+      <div
+        ref={hostRef}
+        className="sky-rotator"
+        style={{
+          position: "absolute",
+          left: "50%",
+          top: "50%",
+          width: swapped ? "100vh" : "100vw",
+          height: swapped ? "100vw" : "100vh",
+          transform: `translate(-50%, -50%) rotate(${rotation.angle}deg)`,
+          transition: rotation.animate ? ROTATION_TRANSITION : "none",
+        }}
+      >
+        <button
+          type="button"
+          onClick={() =>
+            setRotation((prev) => ({ angle: prev.angle + 90, animate: true }))
+          }
+          aria-label="Rotate display 90° clockwise"
+          title="Rotate display 90° clockwise"
+          style={{
+            // Top-right: the spotlight card owns the bottom-right corner.
+            position: "absolute",
+            top: 12,
+            right: 14,
+            zIndex: 20,
+            width: 34,
+            height: 34,
+            padding: 0,
+            borderRadius: "50%",
+            border: "1px solid rgba(190,205,230,0.22)",
+            background: "rgba(8,12,20,0.55)",
+            color: "rgba(190,205,230,0.6)",
+            font: "16px/1 -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif",
+            cursor: "pointer",
+          }}
+        >
+          ⟳
+        </button>
+      </div>
+    </div>
+  );
 }
