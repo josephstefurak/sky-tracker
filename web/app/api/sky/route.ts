@@ -9,6 +9,7 @@ import type { SkyResponse, SkyStatus } from "@/lib/types";
 
 // Live sky on every hit; never statically cached.
 export const dynamic = "force-dynamic";
+export const preferredRegion = 'fra1';
 
 type SatStatus = SkyStatus["satellites"];
 
