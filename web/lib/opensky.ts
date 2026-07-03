@@ -35,7 +35,7 @@ export interface PlaneResult {
   status: PlaneStatus;
 }
 
-const TOKEN_URL =
+export const TOKEN_URL =
   "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
 const STATES_URL =
   `https://opensky-network.org/api/states/all?extended=1` +
@@ -118,6 +118,57 @@ export function parseStates(rows: StateRow[] | null): PlaneObject[] {
   return out;
 }
 
+/**
+ * Flatten an error and its cause chain. Undici's fetch reports every network
+ * failure as `TypeError: fetch failed` and buries the real reason (DNS,
+ * connect timeout, TLS, ECONNRESET...) in `.cause`, so logging only
+ * name/message tells you nothing.
+ */
+export function describeError(e: unknown): string {
+  const parts: string[] = [];
+  let cur: unknown = e;
+  for (let depth = 0; cur != null && depth < 5; depth++) {
+    if (cur instanceof AggregateError) {
+      const inner = cur.errors
+        .map((x) => (x instanceof Error ? `${(x as NodeJS.ErrnoException).code ?? x.name}: ${x.message}` : String(x)))
+        .join("; ");
+      parts.push(`AggregateError(${inner})`);
+      cur = cur.cause;
+    } else if (cur instanceof Error) {
+      const code = (cur as NodeJS.ErrnoException).code;
+      parts.push(`${cur.name}${code ? `[${code}]` : ""}: ${cur.message}`);
+      cur = cur.cause;
+    } else {
+      parts.push(String(cur));
+      break;
+    }
+  }
+  return parts.join(" <- ");
+}
+
+function maskVar(name: string): { present: boolean; length: number; hasWhitespace: boolean; preview: string | null } {
+  const raw = process.env[name];
+  if (!raw) return { present: false, length: 0, hasWhitespace: false, preview: null };
+  return {
+    present: true,
+    length: raw.length,
+    // A trailing newline from a paste into the Vercel dashboard is a classic
+    // way for "valid" credentials to fail upstream.
+    hasWhitespace: raw !== raw.trim(),
+    preview: `${raw.slice(0, 3)}…`,
+  };
+}
+
+/** Masked env/mode report for the temporary debug endpoint. Never exposes secret values. */
+export function openskyEnvDebug() {
+  return {
+    mode: resolveMode().mode,
+    OPENSKY_CLIENT_ID: maskVar("OPENSKY_CLIENT_ID"),
+    OPENSKY_CLIENT_SECRET: { ...maskVar("OPENSKY_CLIENT_SECRET"), preview: null },
+    OPENSKY_ANONYMOUS: process.env.OPENSKY_ANONYMOUS ?? null,
+  };
+}
+
 function resolveMode(): { mode: PlaneStatus["mode"]; id?: string; secret?: string } {
   const id = process.env.OPENSKY_CLIENT_ID?.trim();
   const secret = process.env.OPENSKY_CLIENT_SECRET?.trim();
@@ -157,8 +208,7 @@ async function getToken(id: string, secret: string): Promise<{ ok: true; value: 
     };
     return { ok: true, value: token.value };
   } catch (e) {
-    const err = e as Error;
-    return { ok: false, status: null, detail: `${err.name}: ${err.message}` };
+    return { ok: false, status: null, detail: describeError(e) };
   }
 }
 
@@ -310,10 +360,8 @@ async function fetchPlanes(): Promise<PlaneResult> {
       },
     };
   } catch (e) {
-    const err = e as Error;
-    console.warn(
-      `[sky] OpenSky fetch failed: ${err.name}: ${err.message} (status ${status ?? "n/a"})`
-    );
-    return staleOrEmpty(resolved.mode, `OpenSky unreachable (${err.name}: ${err.message})`);
+    const detail = describeError(e);
+    console.warn(`[sky] OpenSky fetch failed: ${detail} (status ${status ?? "n/a"})`);
+    return staleOrEmpty(resolved.mode, `OpenSky unreachable (${detail})`);
   }
 }
