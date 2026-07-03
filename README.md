@@ -4,6 +4,12 @@ Real-time overhead sky visualization: live satellite (Celestrak TLEs) and
 aircraft (OpenSky) positions drawn as glowing dots on a black dome canvas,
 intended for ceiling projection.
 
+> **v2 lives in [`web/`](web/README.md)** — a single Next.js deployable
+> (Vercel-ready) with OpenSky OAuth2 support, a corrected ceiling-mirror
+> projection, and richer per-object info. Design notes in
+> [`DECISIONS.md`](DECISIONS.md). The `backend/` + `frontend/` pair below
+> is kept intact as the working v1 reference.
+
 Observer is fixed at lat `41.91734343314767`, lon `-87.63808451349306`,
 elevation 180 m (Chicago).
 

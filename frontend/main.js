@@ -1,8 +1,9 @@
 import * as THREE from "three";
 
 // One-line swap to wss://<cloud-run-host>/ws when this is deployed later.
-const WS_URL = 'ws://192.168.1.65:8080/ws'; // use your actual IP
-
+//const WS_URL = 'ws://192.168.1.65:8080/ws';
+const WS_URL = 'ws://localhost:8080/ws';
+//const WS_URL = 'wss://sky-tracker-backend-340783523308.us-central1.run.app/ws';
 // ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
