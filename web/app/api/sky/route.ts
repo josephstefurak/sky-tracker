@@ -10,6 +10,9 @@ import type { SkyResponse, SkyStatus } from "@/lib/types";
 // Live sky on every hit; never statically cached.
 export const dynamic = "force-dynamic";
 export const preferredRegion = 'fra1';
+// Worst case: token grant retries (~20s) then an anonymous fallback states
+// fetch (15s) — keep headroom over the legacy 10s default duration.
+export const maxDuration = 60;
 
 type SatStatus = SkyStatus["satellites"];
 

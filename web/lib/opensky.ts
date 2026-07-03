@@ -12,6 +12,13 @@
  * and HTTP status (the legacy backend logged `OpenSky fetch failed:` with an
  * empty error because timeout exceptions stringify to "" — never again).
  *
+ * The token grant retries transient network failures with backoff, and if the
+ * auth host is outright unreachable (datacenter-IP blocking — the states host
+ * is a different machine and may still answer) an oauth2 request falls back
+ * to an anonymous states fetch unless OPENSKY_ANONYMOUS=0. A credential
+ * REJECTION (HTTP 400/401/403 from the token endpoint) never downgrades — it
+ * surfaces loudly as a config error.
+ *
  * A module-level snapshot cache (TTL just under the client poll interval)
  * means any number of viewers costs one upstream call per ~10s per warm
  * lambda. On a 429 we back off and serve a recent snapshot for up to
@@ -37,7 +44,7 @@ export interface PlaneResult {
 
 export const TOKEN_URL =
   "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token";
-const STATES_URL =
+export const STATES_URL =
   `https://opensky-network.org/api/states/all?extended=1` +
   `&lamin=${PLANE_BBOX.lamin}&lomin=${PLANE_BBOX.lomin}` +
   `&lamax=${PLANE_BBOX.lamax}&lomax=${PLANE_BBOX.lomax}`;
@@ -50,7 +57,14 @@ const MSG_DISABLED =
   "plane feed disabled (no OpenSky credentials and OPENSKY_ANONYMOUS=0) — satellites only";
 
 // Module state (persists per warm serverless instance).
-let snapshot: { planes: PlaneObject[]; fetchedAt: number; creditsRemaining: number | null } | null = null;
+let snapshot: {
+  planes: PlaneObject[];
+  fetchedAt: number;
+  creditsRemaining: number | null;
+  /** Mode that actually produced the snapshot (oauth2 may fall back to anonymous). */
+  mode: PlaneStatus["mode"];
+  message: string | null;
+} | null = null;
 let token: { value: string; expiresAt: number } | null = null;
 let backoffUntil = 0;
 let backoffReason = "";
@@ -177,39 +191,94 @@ function resolveMode(): { mode: PlaneStatus["mode"]; id?: string; secret?: strin
   return { mode: "disabled" };
 }
 
+// Token grant retry policy. Per-attempt timeout is short so every attempt
+// plus backoff (~20s worst case) fits inside the serverless duration budget.
+const TOKEN_ATTEMPTS = 3;
+const TOKEN_BACKOFF_MS = [500, 1500, 4000];
+const TOKEN_ATTEMPT_TIMEOUT_MS = 6_000;
+
+const RETRYABLE_CODES = new Set([
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
+  "ETIMEDOUT",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+]);
+
+/**
+ * True when an error (or anything in its cause chain) is a transport-level
+ * failure worth retrying. HTTP 400/401/403 never reach here — fetch resolved,
+ * so the response is handled (and NOT retried) before anything is thrown.
+ */
+function isRetryableNetworkError(e: unknown): boolean {
+  const queue: unknown[] = [e];
+  for (let depth = 0; queue.length > 0 && depth < 10; depth++) {
+    const cur = queue.shift();
+    if (!(cur instanceof Error)) continue;
+    const code = (cur as NodeJS.ErrnoException).code;
+    if (code && RETRYABLE_CODES.has(code)) return true;
+    // AbortSignal.timeout() fires TimeoutError (AbortError on older runtimes).
+    if (cur.name === "TimeoutError" || cur.name === "AbortError") return true;
+    if (cur.message === "fetch failed") return true; // undici's generic network wrapper
+    if (cur instanceof AggregateError) queue.push(...cur.errors);
+    if (cur.cause) queue.push(cur.cause);
+  }
+  return false;
+}
+
 async function getToken(id: string, secret: string): Promise<{ ok: true; value: string } | { ok: false; status: number | null; detail: string }> {
   if (token && Date.now() < token.expiresAt) return { ok: true, value: token.value };
-  try {
-    const res = await fetch(TOKEN_URL, {
-      method: "POST",
-      headers: {
-        "content-type": "application/x-www-form-urlencoded",
-        "user-agent": USER_AGENT,
-      },
-      body: new URLSearchParams({
-        grant_type: "client_credentials",
-        client_id: id,
-        client_secret: secret,
-      }),
-      signal: AbortSignal.timeout(15_000),
-      cache: "no-store",
-    });
-    if (!res.ok) {
-      token = null;
-      return { ok: false, status: res.status, detail: `token endpoint HTTP ${res.status}` };
+
+  let lastDetail = "token grant not attempted";
+  for (let attempt = 1; attempt <= TOKEN_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(TOKEN_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          "user-agent": USER_AGENT,
+        },
+        body: new URLSearchParams({
+          grant_type: "client_credentials",
+          client_id: id,
+          client_secret: secret,
+        }),
+        signal: AbortSignal.timeout(TOKEN_ATTEMPT_TIMEOUT_MS),
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        // The endpoint answered: credential/config/server problem, not a
+        // network one. Retrying would just get the same answer.
+        token = null;
+        return { ok: false, status: res.status, detail: `token endpoint HTTP ${res.status}` };
+      }
+      const body = (await res.json()) as { access_token?: string; expires_in?: number };
+      if (!body.access_token) {
+        return { ok: false, status: res.status, detail: "token response missing access_token" };
+      }
+      token = {
+        value: body.access_token,
+        expiresAt: Date.now() + Math.max(60, (body.expires_in ?? 1800) - 60) * 1000,
+      };
+      return { ok: true, value: token.value };
+    } catch (e) {
+      lastDetail = describeError(e);
+      const willRetry = isRetryableNetworkError(e) && attempt < TOKEN_ATTEMPTS;
+      console.warn(
+        `[sky] OpenSky token attempt ${attempt}/${TOKEN_ATTEMPTS} failed: ${lastDetail}${willRetry ? " — retrying" : ""}`
+      );
+      if (!willRetry) break;
+      const base = TOKEN_BACKOFF_MS[attempt - 1] ?? TOKEN_BACKOFF_MS[TOKEN_BACKOFF_MS.length - 1];
+      const jittered = Math.round(base * (0.75 + Math.random() * 0.5));
+      await new Promise((r) => setTimeout(r, jittered));
     }
-    const body = (await res.json()) as { access_token?: string; expires_in?: number };
-    if (!body.access_token) {
-      return { ok: false, status: res.status, detail: "token response missing access_token" };
-    }
-    token = {
-      value: body.access_token,
-      expiresAt: Date.now() + Math.max(60, (body.expires_in ?? 1800) - 60) * 1000,
-    };
-    return { ok: true, value: token.value };
-  } catch (e) {
-    return { ok: false, status: null, detail: describeError(e) };
   }
+  // If every attempt died at the same connect timeout, the auth host is hard-
+  // blocking this IP range and retries will never help — the anonymous states
+  // fetch (a different host) is the only internal fallback.
+  return { ok: false, status: null, detail: lastDetail };
 }
 
 function chicagoTime(ms: number): string {
@@ -249,14 +318,13 @@ function staleOrEmpty(mode: PlaneStatus["mode"], message: string): PlaneResult {
 export async function getPlanes(): Promise<PlaneResult> {
   // Fresh snapshot: serve it (many clients share one upstream call).
   if (snapshot && Date.now() - snapshot.fetchedAt < OPENSKY_SNAPSHOT_TTL_MS) {
-    const { mode } = resolveMode();
     return {
       planes: snapshot.planes,
       status: {
         ok: true,
         count: snapshot.planes.length,
-        mode,
-        message: mode === "anonymous" ? MSG_ANONYMOUS : null,
+        mode: snapshot.mode,
+        message: snapshot.message,
         creditsRemaining: snapshot.creditsRemaining,
       },
     };
@@ -288,23 +356,47 @@ async function fetchPlanes(): Promise<PlaneResult> {
 
   const headers: Record<string, string> = { "user-agent": USER_AGENT };
 
+  // Effective mode for THIS request: oauth2 may downgrade to anonymous below
+  // when the auth host is unreachable at the network level.
+  let mode: PlaneStatus["mode"] = resolved.mode;
+  let modeMessage: string | null = mode === "anonymous" ? MSG_ANONYMOUS : null;
+
   if (resolved.mode === "oauth2") {
     const tok = await getToken(resolved.id!, resolved.secret!);
-    if (!tok.ok) {
-      if (tok.status === 400 || tok.status === 401 || tok.status === 403) {
-        const message =
-          `OpenSky credentials rejected (HTTP ${tok.status}) — check OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET`;
-        console.warn(`[sky] OpenSky auth failed: ${tok.detail}`);
-        // A config error must be visible, not silently downgraded to anonymous.
-        return {
-          planes: [],
-          status: { ok: false, count: 0, mode: "disabled", message, creditsRemaining: null },
-        };
-      }
+    if (tok.ok) {
+      headers.authorization = `Bearer ${tok.value}`;
+    } else if (tok.status === 400 || tok.status === 401 || tok.status === 403) {
+      const message =
+        `OpenSky credentials rejected (HTTP ${tok.status}) — check OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET`;
+      console.warn(`[sky] OpenSky auth failed: ${tok.detail}`);
+      // A config error must be visible, not silently downgraded to anonymous.
+      return {
+        planes: [],
+        status: { ok: false, count: 0, mode: "disabled", message, creditsRemaining: null },
+      };
+    } else if (tok.status !== null) {
+      // Token endpoint reachable but erroring (5xx, malformed body): not a
+      // network block, so anonymous fallback stays out of it.
       console.warn(`[sky] OpenSky token fetch failed: ${tok.detail}`);
+      return staleOrEmpty("oauth2", `OpenSky auth unavailable (${tok.detail})`);
+    } else if (process.env.OPENSKY_ANONYMOUS !== "0") {
+      // Auth host unreachable at the network level (every retry timed out).
+      // The states API is a different hostname (though it may share the auth
+      // host's IP — blocking is often per-service, not per-address) and may
+      // still answer, so try this request anonymously (400 credits/day)
+      // instead of returning nothing. If states is blocked too, the normal
+      // stale-snapshot degradation below still applies.
+      mode = "anonymous";
+      modeMessage = `OpenSky auth unreachable — using anonymous access (400 credits/day) as fallback`;
+      console.warn(
+        `[sky] OpenSky auth unreachable (${tok.detail}) — falling back to anonymous states fetch`
+      );
+    } else {
+      console.warn(
+        `[sky] OpenSky token fetch failed: ${tok.detail} (OPENSKY_ANONYMOUS=0 — anonymous fallback disabled)`
+      );
       return staleOrEmpty("oauth2", `OpenSky auth unreachable (${tok.detail})`);
     }
-    headers.authorization = `Bearer ${tok.value}`;
   }
 
   let status: number | null = null;
@@ -329,39 +421,39 @@ async function fetchPlanes(): Promise<PlaneResult> {
       console.warn(
         `[sky] OpenSky fetch failed: HTTP 429 (rate limited), backing off until ${chicagoTime(backoffUntil)}`
       );
-      return staleOrEmpty(resolved.mode, `${backoffReason} until ${chicagoTime(backoffUntil)}`);
+      return staleOrEmpty(mode, `${backoffReason} until ${chicagoTime(backoffUntil)}`);
     }
     if (res.status === 401 || res.status === 403) {
       // Token expired mid-window or anonymous access blocked for this IP.
       token = null;
       const detail =
-        resolved.mode === "oauth2"
+        mode === "oauth2"
           ? `OpenSky rejected the request (HTTP ${res.status}) — token invalidated, will retry`
           : `OpenSky anonymous access blocked (HTTP ${res.status}) — set OPENSKY_CLIENT_ID/SECRET`;
-      console.warn(`[sky] OpenSky fetch failed: HTTP ${res.status} (${resolved.mode})`);
-      return staleOrEmpty(resolved.mode, detail);
+      console.warn(`[sky] OpenSky fetch failed: HTTP ${res.status} (${mode})`);
+      return staleOrEmpty(mode, detail);
     }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const body = (await res.json()) as { states: StateRow[] | null };
     const planes = parseStates(body.states);
-    snapshot = { planes, fetchedAt: Date.now(), creditsRemaining };
+    snapshot = { planes, fetchedAt: Date.now(), creditsRemaining, mode, message: modeMessage };
     console.log(
-      `[sky] OpenSky: ${planes.length} aircraft above ${PLANE_MIN_ALT_DEG} deg (${resolved.mode}, credits left: ${creditsRemaining ?? "?"})`
+      `[sky] OpenSky: ${planes.length} aircraft above ${PLANE_MIN_ALT_DEG} deg (${mode}, credits left: ${creditsRemaining ?? "?"})`
     );
     return {
       planes,
       status: {
         ok: true,
         count: planes.length,
-        mode: resolved.mode,
-        message: resolved.mode === "anonymous" ? MSG_ANONYMOUS : null,
+        mode,
+        message: modeMessage,
         creditsRemaining,
       },
     };
   } catch (e) {
     const detail = describeError(e);
     console.warn(`[sky] OpenSky fetch failed: ${detail} (status ${status ?? "n/a"})`);
-    return staleOrEmpty(resolved.mode, `OpenSky unreachable (${detail})`);
+    return staleOrEmpty(mode, `OpenSky unreachable (${detail})`);
   }
 }
