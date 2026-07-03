@@ -2,17 +2,17 @@ import { NextResponse } from "next/server";
 import { computeAstro, sunEquatorial, sunPosition } from "@/lib/astro";
 import { OBSERVER } from "@/lib/config";
 import { enrichPlanes } from "@/lib/enrich";
-import { getPlanes } from "@/lib/opensky";
+import { getPlanes } from "@/lib/planes";
 import { computeSatellites } from "@/lib/satellites";
 import { getTleSet } from "@/lib/tle";
 import type { SkyResponse, SkyStatus } from "@/lib/types";
 
 // Live sky on every hit; never statically cached.
 export const dynamic = "force-dynamic";
-export const preferredRegion = 'fra1';
-// Worst case: token grant retries (~20s) then an anonymous fallback states
-// fetch (15s) — keep headroom over the legacy 10s default duration.
-export const maxDuration = 60;
+// No region pin: the ADS-B aggregator and adsbdb are US-hosted, so Vercel's
+// default US region beats the old fra1 pin (which existed for OpenSky).
+// Worst case: one 10s plane fetch plus bounded enrichment lookups.
+export const maxDuration = 30;
 
 type SatStatus = SkyStatus["satellites"];
 
@@ -56,7 +56,6 @@ export async function GET() {
           count: 0,
           mode: "disabled" as const,
           message: `plane pipeline failed (${e.name}: ${e.message})`,
-          creditsRemaining: null,
         },
       };
     }),

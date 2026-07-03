@@ -242,3 +242,61 @@ Added (each kept dim/ambient; legibility from across a room first):
 - Schlyter lunar series is accurate to ~1° — fine for a 24 px moon marker.
 - Aircraft elevation uses v1's flat-earth atan2 model (≤ ~0.5° error inside
   the widened bbox) — kept for parity.
+
+## 12. OpenSky → airplanes.live (2026-07-03)
+
+Everything in §1/§6 about OpenSky auth modes and credit economics is now
+**historical**: OpenSky was dropped entirely the same day.
+
+**Why:** OpenSky hard-blocks Vercel's datacenter IP ranges per-IP at the TCP
+connect stage. The `/api/debug/opensky` probe showed both
+`auth.opensky-network.org` and `opensky-network.org` resolve to the **same
+address** and both time out before any HTTP exchange
+(`UND_ERR_CONNECT_TIMEOUT`). No OAuth credential, retry policy, or anonymous
+fallback can route around a network-level block — the entire mode machinery
+in `lib/opensky.ts` was solving the wrong problem.
+
+**Replacement:** community ADS-B aggregators that all speak the ADSBExchange
+v2 response shape, so one parser serves any of them. Reachability probes
+from a Vercel US deploy (iad1):
+
+| Host | Result |
+| --- | --- |
+| airplanes.live | HTTP 200, **99 aircraft** in a 25 nm circle — chosen default |
+| adsb.fi | HTTP 200, 43 aircraft, but 429s on rapid repeat — documented fallback |
+| adsb.one | HTTP 403, Cloudflare-blocked for datacenter/non-browser clients |
+
+**Swap mechanism:** `PLANES_API_BASE` env var (default
+`https://api.airplanes.live`); `lib/planes.ts` (renamed from
+`lib/opensky.ts`) builds the point/radius URL from `OBSERVER` +
+`PLANE_RADIUS_NM` (25). adsb.fi's divergent path scheme
+(`/v2/lat/../lon/../dist/..` vs `/v2/point/../../..`) and array key
+(`aircraft` vs `ac`) are auto-detected, so
+`PLANES_API_BASE=https://opendata.adsb.fi/api` works with no code change.
+
+**Format/unit differences vs OpenSky** (handled in `parseAircraft`):
+
+- Named-field objects instead of positional state arrays.
+- Imperial units: `alt_baro`/`alt_geom` in **feet** (×0.3048 → m before the
+  unchanged az/alt math), `baro_rate`/`geom_rate` in **ft/min** (×0.00508 →
+  m/s), `gs` already in **knots** (no conversion — OpenSky needed ×1.94384).
+- On-ground is the sentinel `alt_baro: "ground"`, not a boolean field.
+- Category is an emitter letter code (`A1`..`A7` map to the same
+  light/small/large/heavy/rotorcraft buckets the OpenSky numerals did;
+  B/C/D → "other").
+- No credit system, no rate-limit headers: `creditsRemaining` dropped from
+  `SkyStatus`; the ~10 s server-side snapshot cache is the etiquette cap,
+  429 still backs off (≥60 s, honoring `Retry-After`) and degrades to a
+  stale snapshot, then satellites-only. Plane failures still never break
+  satellites.
+
+**Region:** the fra1 pin on `/api/sky` (an OpenSky-era experiment) is
+removed — these aggregators and adsbdb are US-friendly, so the function now
+runs in Vercel's default US region, which is also where the probes ran.
+
+**Enrichment note:** airplanes.live already returns `t` (type code),
+`desc` (type name), `r` (registration), and `ownOp` (operator) inline —
+enough to replace the adsbdb `/v0/aircraft` lookup (though not the photo
+thumbnail or the `/v0/callsign` route data). adsbdb enrichment is kept
+unchanged for now; if adsbdb becomes a problem, the aircraft-info half can
+be sourced from the feed for free.

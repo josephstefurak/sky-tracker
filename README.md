@@ -5,7 +5,7 @@ aircraft (OpenSky) positions drawn as glowing dots on a black dome canvas,
 intended for ceiling projection.
 
 > **v2 lives in [`web/`](web/README.md)** — a single Next.js deployable
-> (Vercel-ready) with OpenSky OAuth2 support, a corrected ceiling-mirror
+> (Vercel-ready) with an airplanes.live ADS-B feed, a corrected ceiling-mirror
 > projection, and richer per-object info. Design notes in
 > [`DECISIONS.md`](DECISIONS.md). The `backend/` + `frontend/` pair below
 > is kept intact as the working v1 reference.

@@ -59,7 +59,7 @@ export interface PlaneObject {
   heading: number | null; // degrees true, direction of travel
   verticalRateMs: number | null; // + climbing / - descending, m/s
   groundDistKm: number | null; // great-circle distance observer -> plane
-  category: PlaneCategory | null; // from OpenSky extended category (null = unknown)
+  category: PlaneCategory | null; // from the ADS-B emitter category (null = unknown)
 
   // ---- Route enrichment (adsbdb /v0/callsign), present once cached ----
   origin?: string | null; // IATA, e.g. "ORD"
@@ -88,7 +88,7 @@ export interface AstroState {
   twilight: TwilightState;
 }
 
-export type PlaneFeedMode = "oauth2" | "anonymous" | "disabled";
+export type PlaneFeedMode = "live" | "disabled";
 
 export interface SkyStatus {
   satellites: {
@@ -105,8 +105,6 @@ export interface SkyStatus {
     mode: PlaneFeedMode;
     /** Human-readable state, e.g. why planes are missing or degraded. */
     message: string | null;
-    /** OpenSky X-Rate-Limit-Remaining header when available. */
-    creditsRemaining: number | null;
   };
 }
 

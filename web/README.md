@@ -1,8 +1,9 @@
 # sky-tracker web (v2)
 
-Live overhead sky — satellites (Celestrak + SGP4) and aircraft (OpenSky,
-routes via adsbdb) rendered as a ceiling-projected dome. One Next.js app:
-API route + Three.js client, deployable to Vercel with zero extra services.
+Live overhead sky — satellites (Celestrak + SGP4) and aircraft
+(airplanes.live ADS-B, routes via adsbdb) rendered as a ceiling-projected
+dome. One Next.js app: API route + Three.js client, deployable to Vercel
+with zero extra services.
 
 Observer is fixed at lat `41.91734343314767`, lon `-87.63808451349306`,
 elevation 180 m (Chicago) — see `lib/config.ts`.
@@ -16,19 +17,10 @@ npm run dev          # http://localhost:3000
 ```
 
 Works immediately with **no credentials**: satellites always render; planes
-use OpenSky's anonymous API (400 credits/day per IP) and degrade gracefully
-to satellites-only with an on-screen message when that runs out.
-
-### OpenSky credentials (recommended: 4000 credits/day)
-
-```bash
-cp .env.example .env.local   # then fill in:
-# OPENSKY_CLIENT_ID=...
-# OPENSKY_CLIENT_SECRET=...
-```
-
-Create them free: <https://opensky-network.org> → register → account page →
-create an **API client**. Details in `../DECISIONS.md` §1.
+come from airplanes.live's free community API and degrade gracefully to
+satellites-only with an on-screen message if it's ever unreachable or
+rate-limited. Optionally set `PLANES_API_BASE` to swap the ADS-B host
+(see `.env.example` and `../DECISIONS.md` §12).
 
 ## Deploy to Vercel
 
@@ -37,9 +29,8 @@ npx vercel          # from web/ — or import the repo in the dashboard
 ```
 
 If importing the repo in the Vercel dashboard, set **Root Directory** to
-`web/`. Then add `OPENSKY_CLIENT_ID` and `OPENSKY_CLIENT_SECRET` under
-Project → Settings → Environment Variables and redeploy. That's the entire
-setup — no database, no workers, no websockets.
+`web/`. No environment variables are required. That's the entire setup —
+no database, no workers, no websockets.
 
 ## Orientation (ceiling mirror)
 
