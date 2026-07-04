@@ -6,10 +6,13 @@
 
 import {
   CEILING_MIRROR,
+  getMapRotationQuarters,
   headingToRotationZ,
   headingToRotationZWith,
+  mapAzimuthOffsetDegWith,
   project,
   projectWith,
+  setMapRotationQuarters,
 } from "../lib/projection";
 
 let failures = 0;
@@ -147,6 +150,81 @@ check("CEILING_MIRROR is enabled by default", CEILING_MIRROR === true);
   const out = { x: 0, y: 0 };
   const ret = project(90, 45, R, out);
   check("project(out) writes and returns the same object", ret === out && out.x !== 0);
+}
+
+// --- Map rotation (screen-clockwise quarter-turn azimuth offset) -------------
+{
+  check("map rotation defaults to 0 quarters", getMapRotationQuarters() === 0);
+
+  // One press = one screen-CLOCKWISE step, regardless of mirror mode. With
+  // the mirror on (default), N walks top → right → bottom → left.
+  setMapRotationQuarters(1);
+  const n1 = project(0, 0, R);
+  check("map q=1: N label lands on the RIGHT", n1.x > 0 && approx(n1.y, 0), JSON.stringify(n1));
+  const e1 = project(90, 0, R);
+  check("map q=1: E label lands at the TOP", approx(e1.x, 0) && e1.y > 0, JSON.stringify(e1));
+
+  // The chevron composes the same offset: heading 90 keeps pointing at
+  // wherever the E label now sits.
+  const tip1 = rotate({ x: 0, y: 1 }, headingToRotationZ(90));
+  check(
+    "map q=1: heading-90 chevron points at the rotated E label",
+    approx(tip1.x, e1.x / R) && approx(tip1.y, e1.y / R),
+    JSON.stringify({ tip1, e1 })
+  );
+
+  setMapRotationQuarters(2);
+  const n2 = project(0, 0, R);
+  const s2 = project(180, 0, R);
+  check("map q=2: N label at the BOTTOM", approx(n2.x, 0) && n2.y < 0, JSON.stringify(n2));
+  check("map q=2: S label at the TOP", approx(s2.x, 0) && s2.y > 0, JSON.stringify(s2));
+
+  setMapRotationQuarters(3);
+  const n3 = project(0, 0, R);
+  check("map q=3: N label on the LEFT", n3.x < 0 && approx(n3.y, 0), JSON.stringify(n3));
+
+  // Rigid rotation: chirality of the ring is preserved (E stays 90° counter-
+  // clockwise of N on screen in mirrored mode, at every quarter).
+  for (const q of [0, 1, 2, 3]) {
+    setMapRotationQuarters(q);
+    const n = project(0, 0, R);
+    const e = project(90, 0, R);
+    const cross = n.x * e.y - n.y * e.x; // >0 ⇔ E is 90° CCW of N
+    check(`map q=${q}: ring chirality preserved (E is CCW of N)`, cross > 0);
+  }
+
+  // Altitude law is untouched by the offset.
+  setMapRotationQuarters(1);
+  const mid = project(321, 45, R);
+  check("map rotation preserves the radius law", approx(Math.hypot(mid.x, mid.y), R / 2));
+
+  // Normalization.
+  setMapRotationQuarters(4);
+  check("map rotation normalizes q=4 → 0", getMapRotationQuarters() === 0);
+  setMapRotationQuarters(-1);
+  check("map rotation normalizes q=-1 → 3", getMapRotationQuarters() === 3);
+  setMapRotationQuarters(6);
+  check("map rotation normalizes q=6 → 2", getMapRotationQuarters() === 2);
+
+  // The data-space offset flips sign with the mirror (mirroring flips the
+  // handedness of every rotation) so the SCREEN direction stays clockwise.
+  check("offset helper: legacy q=1 → +90°", mapAzimuthOffsetDegWith(false, 1) === 90);
+  check("offset helper: mirrored q=1 → -90°", mapAzimuthOffsetDegWith(true, 1) === -90);
+  const nLegacy = projectWith(false, 0 + mapAzimuthOffsetDegWith(false, 1), 0, R);
+  check(
+    "legacy q=1: N also lands on the RIGHT (screen-clockwise in both modes)",
+    nLegacy.x > 0 && approx(nLegacy.y, 0),
+    JSON.stringify(nLegacy)
+  );
+
+  // Reset: q=0 restores the base mapping exactly.
+  setMapRotationQuarters(0);
+  const back = project(37, 21, R);
+  const pure = projectWith(CEILING_MIRROR, 37, 21, R);
+  check(
+    "map rotation reset restores the base mapping",
+    approx(back.x, pure.x) && approx(back.y, pure.y)
+  );
 }
 
 if (failures > 0) {

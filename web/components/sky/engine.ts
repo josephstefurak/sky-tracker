@@ -10,7 +10,12 @@
  */
 
 import * as THREE from "three";
-import { headingToRotationZ, project } from "@/lib/projection";
+import {
+  getMapRotationQuarters,
+  headingToRotationZ,
+  project,
+  setMapRotationQuarters as setProjectionMapRotation,
+} from "@/lib/projection";
 import type {
   AstroState,
   PlaneObject,
@@ -333,6 +338,25 @@ export class SkyEngine {
     this.pausedAt = performance.now();
   }
 
+  /**
+   * Re-aim the dome's compass (map rotation, screen-clockwise quarter turns).
+   * Markers and labels pick the new mapping up on the next frame because
+   * every position flows through project(); this refreshes what CACHES
+   * projected positions: dome furniture (cardinal + ring labels), screen-
+   * space trail samples (cleared, as on resize), and the astro layers
+   * (sun, moon, horizon glow band).
+   */
+  setMapRotationQuarters(quarters: number): void {
+    if (this.disposed) return;
+    const before = getMapRotationQuarters();
+    setProjectionMapRotation(quarters);
+    if (getMapRotationQuarters() === before) return;
+    this.buildDome();
+    for (const rec of this.tracked.values()) rec.trail.length = 0;
+    this.bgKey = ""; // glow band must repaint toward the sun's moved dome point
+    this.updateAstroLayers();
+  }
+
   resume(): void {
     if (this.running || this.disposed) return;
     // Shift every wall-clock anchor by the pause duration so dead reckoning
@@ -610,8 +634,12 @@ export class SkyEngine {
   private clearDecorations(): void {
     for (const o of this.decorations) {
       this.scene.remove(o);
+      // As in disposeRecord: never dispose a Sprite's geometry — three shares
+      // ONE geometry across all sprites, and map-rotation rebuilds would
+      // churn every sprite on screen (labels, dots, sun) on each press.
       const mesh = o as THREE.Mesh;
-      if (mesh.geometry) mesh.geometry.dispose();
+      if (mesh.geometry && !(o as THREE.Sprite).isSprite)
+        mesh.geometry.dispose();
       const mat = (o as THREE.Mesh).material as THREE.Material & {
         map?: THREE.Texture;
       };
@@ -659,8 +687,9 @@ export class SkyEngine {
     this.addDecoration(overhead, 4);
 
     // Cardinal labels just inside the horizon ring. Positions flow through
-    // project(), so the ceiling mirror automatically puts E/W on the correct
-    // sides for a viewer looking up.
+    // project(), so the ceiling mirror puts E/W on the correct sides for a
+    // viewer looking up and the map rotation re-seats all four — while each
+    // glyph stays upright (sprites always face the camera, never rotated).
     const cardinals = [
       { text: "N", az: 0 },
       { text: "E", az: 90 },

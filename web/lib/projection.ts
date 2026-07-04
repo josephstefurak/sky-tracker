@@ -25,9 +25,46 @@
  *
  * Text is never mirrored: we mirror coordinates and leave sprites upright —
  * never apply a negative scale to the scene or canvas (it would flip glyphs).
+ *
+ * MAP ROTATION (projector aiming)
+ * -------------------------------
+ * A presentation-layer quarter-turn offset composed ON TOP of the mapping so
+ * the compass can face any screen edge (e.g. North at the bottom to match how
+ * the projector is aimed in a room). `mapRotationQuarters` counts SCREEN-
+ * clockwise 90° steps; because mirroring flips the handedness of every
+ * rotation, one screen-clockwise quarter is -90° of azimuth when mirrored and
+ * +90° when not. The offset enters only through project() and
+ * headingToRotationZ() — raw az/alt data, CEILING_MIRROR, and the pure
+ * *With() helpers are untouched, and text stays upright because positions
+ * rotate while glyphs never do.
  */
 
 export const CEILING_MIRROR = true;
+
+let mapRotationQuarters = 0;
+
+/** Set the map orientation in screen-clockwise quarter-turns (any integer;
+ *  normalized into 0–3). */
+export function setMapRotationQuarters(quarters: number): void {
+  mapRotationQuarters = ((Math.round(quarters) % 4) + 4) % 4;
+}
+
+export function getMapRotationQuarters(): number {
+  return mapRotationQuarters;
+}
+
+/** Azimuth offset (deg) realizing `quarters` screen-clockwise steps under the
+ *  given mirror mode (exported for tests). */
+export function mapAzimuthOffsetDegWith(
+  mirror: boolean,
+  quarters: number
+): number {
+  return (mirror ? -90 : 90) * quarters;
+}
+
+function mapAzimuthOffsetDeg(): number {
+  return mapAzimuthOffsetDegWith(CEILING_MIRROR, mapRotationQuarters);
+}
 
 export interface Vec2 {
   x: number;
@@ -65,17 +102,30 @@ export function headingToRotationZWith(
   return (mirror ? 1 : -1) * headingDeg * DEG;
 }
 
-/** Project an az/alt onto the dome using the configured mirror mode. */
+/** Project an az/alt onto the dome: configured mirror mode + map rotation. */
 export function project(
   azDeg: number,
   altDeg: number,
   radius: number,
   out?: Vec2
 ): Vec2 {
-  return projectWith(CEILING_MIRROR, azDeg, altDeg, radius, out);
+  return projectWith(
+    CEILING_MIRROR,
+    azDeg + mapAzimuthOffsetDeg(),
+    altDeg,
+    radius,
+    out
+  );
 }
 
-/** Chevron/marker rotation for a compass heading, configured mirror mode. */
+/**
+ * Chevron/marker rotation for a compass heading, configured mirror mode +
+ * map rotation. The same azimuth offset is composed into the heading so a
+ * chevron keeps pointing at the (rotated) cardinal matching its heading.
+ */
 export function headingToRotationZ(headingDeg: number): number {
-  return headingToRotationZWith(CEILING_MIRROR, headingDeg);
+  return headingToRotationZWith(
+    CEILING_MIRROR,
+    headingDeg + mapAzimuthOffsetDeg()
+  );
 }
