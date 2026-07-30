@@ -5,6 +5,7 @@
  * Styling is dim and ambient: this shares a ceiling with the night sky.
  */
 
+import { formatClock } from "@/lib/timezone";
 import type { PlaneObject, SatObject, SkyResponse } from "@/lib/types";
 import type { EngineStats, TrackedRecord } from "./engine";
 
@@ -44,6 +45,11 @@ export class Hud {
   private snapshot: SkyResponse | null = null;
   private spotIndex = -1;
   private cardShown = false;
+
+  /** IANA zone for the footer clock; null → UTC, explicitly labeled. */
+  private timeZone: string | null = null;
+  /** Which location source is in use, e.g. "your location". */
+  private locationLabel = "";
 
   private readonly tickTimer: number;
   private readonly rotateTimer: number;
@@ -146,6 +152,41 @@ export class Hud {
     this.tick();
   }
 
+  /**
+   * Timezone for the footer clock: the observer's zone, or null when it could
+   * not be determined (the clock then reads UTC and says so). The times shown
+   * follow the sky on the ceiling, not the device in the room.
+   */
+  setTimeZone(timeZone: string | null): void {
+    this.timeZone = timeZone;
+    this.tick();
+  }
+
+  /** Note which location source the sky is computed from ("your location",
+   *  "Chicago (default)", "custom"). Rendered as text, never HTML. */
+  setLocationLabel(label: string): void {
+    this.locationLabel = label;
+    this.tick();
+  }
+
+  /**
+   * Drop the spotlight card and the last snapshot — used when the observer
+   * changes, because the card holds strings copied out of an object that is no
+   * longer in the sky (its "km away" was measured from the old location) and
+   * would otherwise linger for up to a full rotation interval.
+   */
+  clearSpotlight(): void {
+    if (this.fadeTimeout !== null) {
+      clearTimeout(this.fadeTimeout);
+      this.fadeTimeout = null;
+    }
+    this.snapshot = null;
+    this.card.style.opacity = "0";
+    this.cardShown = false;
+    this.spotIndex = -1;
+    this.tick();
+  }
+
   destroy(): void {
     clearInterval(this.tickTimer);
     clearInterval(this.rotateTimer);
@@ -158,13 +199,12 @@ export class Hud {
   private tick(): void {
     const stats = this.getStats();
     const twilight = this.snapshot?.astro.twilight ?? "—";
-    const hhmm = new Date().toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    const hhmm = formatClock(new Date(), this.timeZone);
+    const where = this.locationLabel ? ` · ${this.locationLabel}` : "";
     this.statusLine.textContent =
       `${stats.sat + stats.iss} satellites · ${stats.plane} planes · ` +
-      `${twilight} · ${hhmm}`;
+      `${twilight} · ${hhmm}${where}`;
+    // Re-appended every tick by design: setting textContent wipes children.
     this.statusLine.appendChild(this.stalenessDot);
 
     const age = stats.lastTs > 0 ? Date.now() / 1000 - stats.lastTs : null;

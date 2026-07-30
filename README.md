@@ -10,8 +10,14 @@ intended for ceiling projection.
 > [`DECISIONS.md`](DECISIONS.md). The `backend/` + `frontend/` pair below
 > is kept intact as the working v1 reference.
 
-Observer is fixed at lat `41.91734343314767`, lon `-87.63808451349306`,
-elevation 180 m (Chicago).
+In v2 the observer is **per device**: URL params, then the location stored on
+that device, then browser geolocation, falling back to Chicago
+(lat `41.91734343314767`, lon `-87.63808451349306`, elevation 180 m). See
+[`web/README.md`](web/README.md#where-it-looks-up-from).
+
+The v1 `backend/` below remains hardwired to those Chicago coordinates
+(`position_engine.py`) — it is a frozen reference and was deliberately left
+alone.
 
 ## Run locally
 

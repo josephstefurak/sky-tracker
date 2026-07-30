@@ -261,6 +261,12 @@ export class SkyEngine {
 
     for (const data of msg.objects ?? []) {
       if (!data || !data.id) continue;
+      // az/alt now originate in a request whose coordinates came from a URL
+      // parameter. They are validated server-side, but a single NaN reaching
+      // project() would poison rec.pos and the trail's Float32Array for the
+      // life of the record (NaN bounding sphere = nothing renders), so refuse
+      // it at the door.
+      if (!Number.isFinite(data.az) || !Number.isFinite(data.alt)) continue;
       let rec = this.tracked.get(data.id);
       if (!rec) {
         rec = this.makeRecord(data, now);
@@ -355,6 +361,49 @@ export class SkyEngine {
     for (const rec of this.tracked.values()) rec.trail.length = 0;
     this.bgKey = ""; // glow band must repaint toward the sun's moved dome point
     this.updateAstroLayers();
+  }
+
+  /**
+   * The observer moved: every tracked object belongs to the OLD sky.
+   *
+   * az/alt are topocentric, so a new location invalidates the whole tracked
+   * set — the dead-reckoning anchors, the screen-space trails, and above all
+   * the velocity that ingest() would otherwise sample ACROSS the
+   * discontinuity for an object that happens to be up at both places, which
+   * would send it sweeping at the clamped VEL_CLAMP until the next poll
+   * re-anchored it. Drop the lot and let the next snapshot repopulate.
+   *
+   * Sibling of setMapRotationQuarters, one level deeper: that one refreshes
+   * what CACHES projected positions, this one discards the positions
+   * themselves. Nothing observer-independent is touched — renderer, camera,
+   * dome furniture, glow texture, the sun/moon meshes and the RAF loop all
+   * survive — so this is nothing like destroy(): the engine simply renders an
+   * empty dome until the caller's next snapshot arrives.
+   */
+  resetTracked(): void {
+    if (this.disposed) return;
+
+    for (const rec of this.tracked.values()) this.disposeRecord(rec);
+    // Cleared in place, never reassigned: the debug hook and the HUD hold this
+    // exact Map by reference.
+    this.tracked.clear();
+
+    // No snapshot for the new location yet, so the staleness dot must read
+    // "no data" instead of certifying the old location's timestamp as fresh.
+    this.lastTs = 0;
+
+    // Sun, moon and twilight are all computed for the observer. Hide the two
+    // bodies explicitly: updateAstroLayers() early-returns while astro is
+    // null, so nothing else would move them off the old location's positions.
+    // Invalidating both paint keys forces a repaint on the next snapshot even
+    // if the new values happen to round into the same buckets.
+    this.astro = null;
+    this.bgKey = "";
+    this.moonFractionKey = -1;
+    this.sunSprite.visible = false;
+    this.moonMesh.visible = false;
+    // bgMesh stays visible: its tint holds well enough for one poll, and
+    // hiding it would flash the scene's black background.
   }
 
   resume(): void {

@@ -15,23 +15,29 @@
  * explains what happened, and every log line carries the error class, message
  * and HTTP status.
  *
- * A module-level snapshot cache (TTL just under the client poll interval)
- * means any number of viewers costs one upstream call per ~10s per warm
- * lambda — polite to a free community API. On a 429 we back off (honoring
- * Retry-After) and serve a recent snapshot for up to PLANES_STALE_MAX_MS
- * before degrading to satellites-only.
+ * Module-level snapshot caches (TTL just under the client poll interval) mean
+ * any number of viewers at the same place costs one upstream call per ~10s per
+ * warm lambda — polite to a free community API. Since the observer is now
+ * per-user, snapshots are KEYED by the viewer's grid cell and hold the RAW
+ * upstream aircraft: az/alt/ground-distance are observer-relative, so every
+ * reader projects the shared aircraft from its OWN position. On a 429 we back
+ * off (honoring Retry-After) and serve a recent snapshot for up to
+ * PLANES_STALE_MAX_MS before degrading to satellites-only.
  */
 
 import {
-  OBSERVER,
   PLANE_MIN_ALT_DEG,
   PLANE_RADIUS_NM,
   PLANES_BACKOFF_MS,
+  PLANES_CACHE_GRID_DEG,
+  PLANES_CACHE_MAX_ENTRIES,
   PLANES_SNAPSHOT_TTL_MS,
   PLANES_STALE_MAX_MS,
+  PLANES_UPSTREAM_MAX_PER_MIN,
   USER_AGENT,
 } from "./config";
 import { observerAzAlt } from "./geo";
+import type { Observer } from "./observer";
 import type { PlaneCategory, PlaneObject, SkyStatus } from "./types";
 
 export type PlaneStatus = SkyStatus["planes"];
@@ -49,25 +55,90 @@ const FTMIN_TO_MS = 0.3048 / 60; // ft/min -> m/s
  * Point/radius query URL. airplanes.live and adsb.one use
  * /v2/point/{lat}/{lon}/{nm}; adsb.fi (base https://opendata.adsb.fi/api)
  * spells the same query /v2/lat/{lat}/lon/{lon}/dist/{nm}.
+ *
+ * The coordinates are interpolated into a path, so they must already be
+ * validated finite numbers in range (observerFrom() guarantees it) —
+ * `toFixed(5)` then yields nothing but digits, `-` and `.`, and no caller can
+ * smuggle path segments or a different host into the query.
  */
-export function planesUrl(): string {
+export function planesUrl(observer: Observer): string {
   const base = (process.env.PLANES_API_BASE?.trim() || DEFAULT_API_BASE).replace(/\/+$/, "");
-  const lat = OBSERVER.lat.toFixed(5);
-  const lon = OBSERVER.lon.toFixed(5);
+  const lat = observer.lat.toFixed(5);
+  const lon = observer.lon.toFixed(5);
   if (new URL(base).hostname.endsWith("adsb.fi")) {
     return `${base}/v2/lat/${lat}/lon/${lon}/dist/${PLANE_RADIUS_NM}`;
   }
   return `${base}/v2/point/${lat}/${lon}/${PLANE_RADIUS_NM}`;
 }
 
-// Module state (persists per warm serverless instance).
-let snapshot: {
-  planes: PlaneObject[];
+// ---------------------------------------------------------------------------
+// Module state (persists per warm serverless instance)
+// ---------------------------------------------------------------------------
+
+/** Raw upstream aircraft for one grid cell — never observer-projected. */
+interface Snapshot {
+  aircraft: AdsbAircraft[];
   fetchedAt: number;
-} | null = null;
+}
+
+const snapshots = new Map<string, Snapshot>();
+
+/**
+ * One in-flight upstream fetch per cell. It resolves to the RAW outcome rather
+ * than a finished PlaneResult, so two viewers who share a fetch each still
+ * project the aircraft from their own coordinates.
+ */
+type FetchOutcome =
+  | { kind: "aircraft"; aircraft: AdsbAircraft[] }
+  | { kind: "failure"; message: string };
+
+const inflight = new Map<string, Promise<FetchOutcome>>();
+
+// Backoff is deliberately GLOBAL, not per cell: a 429 is the upstream host
+// rate-limiting our egress IP, which has nothing to do with which patch of sky
+// was requested.
 let backoffUntil = 0;
 let backoffReason = "";
-let inflight: Promise<PlaneResult> | null = null;
+
+// Sliding one-minute window of upstream fetch times. /api/sky is public and
+// takes coordinates from the caller, so a client that varies its coordinates
+// would otherwise miss the per-cell cache on every poll and turn us into an
+// amplifier against a free community API. Fetches beyond the budget degrade to
+// the stale-or-empty path exactly like a rate-limit would.
+const upstreamFetches: number[] = [];
+
+/** Snapshot key: the observer's cell on the PLANES_CACHE_GRID_DEG grid, as
+ *  integer indices so the key carries no float-rounding artifacts. */
+function snapshotKey(observer: Observer): string {
+  const cell = (deg: number) => Math.round(deg / PLANES_CACHE_GRID_DEG);
+  return `${cell(observer.lat)}:${cell(observer.lon)}`;
+}
+
+/** Store a snapshot, evicting the oldest entries past the cap. */
+function storeSnapshot(key: string, aircraft: AdsbAircraft[]): void {
+  snapshots.set(key, { aircraft, fetchedAt: Date.now() });
+  while (snapshots.size > PLANES_CACHE_MAX_ENTRIES) {
+    let oldestKey: string | null = null;
+    let oldestAt = Infinity;
+    for (const [k, snap] of snapshots) {
+      if (snap.fetchedAt < oldestAt) {
+        oldestAt = snap.fetchedAt;
+        oldestKey = k;
+      }
+    }
+    if (oldestKey === null) break;
+    snapshots.delete(oldestKey);
+  }
+}
+
+/** True when the one-minute upstream budget is spent (and prunes the window). */
+function upstreamBudgetSpent(): boolean {
+  const cutoff = Date.now() - 60_000;
+  while (upstreamFetches.length > 0 && upstreamFetches[0] < cutoff) {
+    upstreamFetches.shift();
+  }
+  return upstreamFetches.length >= PLANES_UPSTREAM_MAX_PER_MIN;
+}
 
 /**
  * ADS-B emitter category letters (A1..A7) map onto the same buckets the old
@@ -113,8 +184,19 @@ export interface AdsbAircraft {
   category?: string;
 }
 
-/** Exported for offline tests against a saved v2 point-query sample. */
-export function parseAircraft(list: AdsbAircraft[] | null | undefined): PlaneObject[] {
+/**
+ * Project raw upstream aircraft into observer-relative PlaneObjects. Called
+ * once per request (not once per upstream fetch) because everything azimuthal
+ * here belongs to one specific viewer: `az`, `alt` and `groundDistKm` come
+ * from the observer, while identity, altitude, speed, heading, vertical rate
+ * and category are properties of the aircraft alone.
+ *
+ * Exported for offline tests against a saved v2 point-query sample.
+ */
+export function parseAircraft(
+  list: AdsbAircraft[] | null | undefined,
+  observer: Observer
+): PlaneObject[] {
   const out: PlaneObject[] = [];
   for (const a of list ?? []) {
     const icao24 = String(a.hex ?? "").trim().toLowerCase();
@@ -129,7 +211,7 @@ export function parseAircraft(list: AdsbAircraft[] | null | undefined): PlaneObj
     if (altFt == null) continue;
     const altitudeM = altFt * FT_TO_M;
 
-    const { az, alt, groundM } = observerAzAlt(a.lat, a.lon, altitudeM);
+    const { az, alt, groundM } = observerAzAlt(observer, a.lat, a.lon, altitudeM);
     if (alt <= PLANE_MIN_ALT_DEG) continue;
 
     out.push({
@@ -178,22 +260,39 @@ export function describeError(e: unknown): string {
   return parts.join(" <- ");
 }
 
-function chicagoTime(ms: number): string {
-  return new Date(ms).toLocaleTimeString("en-US", {
-    timeZone: "America/Chicago",
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+/**
+ * How long a pause has left, e.g. "42s" / "3 min". A wait, not a wall-clock
+ * time: this string is shown on the viewer's dome and the server has no idea
+ * which timezone that viewer is in (it used to be formatted in America/Chicago
+ * for everyone).
+ */
+function waitLabel(untilMs: number): string {
+  const seconds = Math.max(0, Math.ceil((untilMs - Date.now()) / 1000));
+  return seconds >= 90 ? `${Math.round(seconds / 60)} min` : `${seconds}s`;
 }
 
-function staleOrEmpty(message: string): PlaneResult {
+/** A successful read: project this cell's aircraft for THIS observer. */
+function live(observer: Observer, aircraft: AdsbAircraft[]): PlaneResult {
+  const planes = parseAircraft(aircraft, observer);
+  return {
+    planes,
+    status: { ok: true, count: planes.length, mode: "live", message: null },
+  };
+}
+
+function staleOrEmpty(
+  observer: Observer,
+  key: string,
+  message: string
+): PlaneResult {
+  const snapshot = snapshots.get(key);
   if (snapshot && Date.now() - snapshot.fetchedAt < PLANES_STALE_MAX_MS) {
+    const planes = parseAircraft(snapshot.aircraft, observer);
     return {
-      planes: snapshot.planes,
+      planes,
       status: {
         ok: false,
-        count: snapshot.planes.length,
+        count: planes.length,
         mode: "live",
         message: `${message} — showing planes from ${Math.round((Date.now() - snapshot.fetchedAt) / 1000)}s ago`,
       },
@@ -205,30 +304,54 @@ function staleOrEmpty(message: string): PlaneResult {
   };
 }
 
-export async function getPlanes(): Promise<PlaneResult> {
-  // Fresh snapshot: serve it (many clients share one upstream call).
+export async function getPlanes(observer: Observer): Promise<PlaneResult> {
+  const key = snapshotKey(observer);
+
+  // Fresh snapshot for this cell: serve it (co-located viewers share one
+  // upstream call), projected from this observer's own position.
+  const snapshot = snapshots.get(key);
   if (snapshot && Date.now() - snapshot.fetchedAt < PLANES_SNAPSHOT_TTL_MS) {
-    return {
-      planes: snapshot.planes,
-      status: { ok: true, count: snapshot.planes.length, mode: "live", message: null },
-    };
+    return live(observer, snapshot.aircraft);
   }
-  if (inflight) return inflight;
-  inflight = fetchPlanes().finally(() => {
-    inflight = null;
-  });
-  return inflight;
+
+  let pending = inflight.get(key);
+  if (!pending) {
+    pending = fetchAircraft(observer, key).finally(() => {
+      inflight.delete(key);
+    });
+    inflight.set(key, pending);
+  }
+  const outcome = await pending;
+  return outcome.kind === "aircraft"
+    ? live(observer, outcome.aircraft)
+    : staleOrEmpty(observer, key, outcome.message);
 }
 
-async function fetchPlanes(): Promise<PlaneResult> {
+async function fetchAircraft(
+  observer: Observer,
+  key: string
+): Promise<FetchOutcome> {
   if (Date.now() < backoffUntil) {
-    return staleOrEmpty(`${backoffReason} — retrying at ${chicagoTime(backoffUntil)}`);
+    return {
+      kind: "failure",
+      message: `${backoffReason} — retrying in ${waitLabel(backoffUntil)}`,
+    };
+  }
+  if (upstreamBudgetSpent()) {
+    console.warn(
+      `[sky] plane fetch skipped: upstream budget of ${PLANES_UPSTREAM_MAX_PER_MIN}/min spent`
+    );
+    return {
+      kind: "failure",
+      message: "plane feed busy — too many distinct locations this minute",
+    };
   }
 
-  const url = planesUrl();
+  const url = planesUrl(observer);
   const host = new URL(url).hostname;
   let status: number | null = null;
   try {
+    upstreamFetches.push(Date.now());
     const res = await fetch(url, {
       headers: { "user-agent": USER_AGENT },
       signal: AbortSignal.timeout(10_000),
@@ -245,26 +368,30 @@ async function fetchPlanes(): Promise<PlaneResult> {
       backoffUntil = Date.now() + waitMs;
       backoffReason = `${host} rate limit hit — planes paused`;
       console.warn(
-        `[sky] plane fetch failed: HTTP 429 from ${host}, backing off until ${chicagoTime(backoffUntil)}`
+        `[sky] plane fetch failed: HTTP 429 from ${host}, backing off until ${new Date(backoffUntil).toISOString()}`
       );
-      return staleOrEmpty(`${backoffReason} until ${chicagoTime(backoffUntil)}`);
+      return {
+        kind: "failure",
+        message: `${backoffReason} — retrying in ${waitLabel(backoffUntil)}`,
+      };
     }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     // airplanes.live/adsb.one name the array `ac`; adsb.fi names it `aircraft`.
     const body = (await res.json()) as { ac?: AdsbAircraft[]; aircraft?: AdsbAircraft[] };
-    const planes = parseAircraft(body.ac ?? body.aircraft);
-    snapshot = { planes, fetchedAt: Date.now() };
+    const aircraft = body.ac ?? body.aircraft ?? [];
+    storeSnapshot(key, aircraft);
+    // Deliberately no coordinates and no cell key: server logs are not a place
+    // to keep anyone's location, and a grid cell is still a ~1 km bucket. The
+    // cache size is the useful non-identifying signal; per-viewer counts (after
+    // the PLANE_MIN_ALT_DEG horizon cut) travel in status.count instead.
     console.log(
-      `[sky] planes: ${planes.length} aircraft above ${PLANE_MIN_ALT_DEG} deg within ${PLANE_RADIUS_NM} nm (${host})`
+      `[sky] planes: ${aircraft.length} aircraft within ${PLANE_RADIUS_NM} nm (${host}, ${snapshots.size} cell${snapshots.size === 1 ? "" : "s"} cached)`
     );
-    return {
-      planes,
-      status: { ok: true, count: planes.length, mode: "live", message: null },
-    };
+    return { kind: "aircraft", aircraft };
   } catch (e) {
     const detail = describeError(e);
     console.warn(`[sky] plane fetch failed: ${detail} (${host}, status ${status ?? "n/a"})`);
-    return staleOrEmpty(`plane feed unreachable (${detail})`);
+    return { kind: "failure", message: `plane feed unreachable (${detail})` };
   }
 }

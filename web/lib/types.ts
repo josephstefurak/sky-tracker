@@ -10,7 +10,11 @@
  *    90 = zenith). It is NOT the flight altitude; that is `altitudeM`.
  *  - `id` is stable across polls and namespaced ("sat:25544", "plane:a3a4ed")
  *    so satellite NORAD ids can never collide with aircraft hex codes.
+ *  - every az/alt in a response is relative to ONE observer, the one echoed in
+ *    `SkyResponse.observer`.
  */
+
+import type { Observer } from "./observer";
 
 export type TwilightState =
   | "day" // sun above horizon
@@ -111,6 +115,9 @@ export interface SkyStatus {
 export interface SkyResponse {
   /** Unix seconds, server time of this snapshot. */
   ts: number;
+  /** The observer this snapshot was computed for — the coordinates the client
+   *  sent, or the default when they were absent or invalid. */
+  observer: Observer;
   objects: SkyObject[];
   astro: AstroState;
   status: SkyStatus;

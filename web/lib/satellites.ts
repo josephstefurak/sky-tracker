@@ -7,18 +7,13 @@
  */
 
 import * as satellite from "satellite.js";
-import { OBSERVER, SAT_MIN_ALT_DEG } from "./config";
+import { SAT_MIN_ALT_DEG } from "./config";
+import type { Observer } from "./observer";
 import type { SatCategory, SatObject } from "./types";
 import type { TleRecord } from "./tle";
 
 const EARTH_RADIUS_KM = 6371;
 const ISS_NORAD_ID = 25544;
-
-const observerGd = {
-  latitude: satellite.degreesToRadians(OBSERVER.lat),
-  longitude: satellite.degreesToRadians(OBSERVER.lon),
-  height: OBSERVER.elevationM / 1000,
-};
 
 type SatRec = ReturnType<typeof satellite.twoline2satrec>;
 
@@ -56,9 +51,20 @@ export function computeSatellites(
   records: TleRecord[],
   date: Date,
   sunUnit: [number, number, number],
-  sunAltDeg: number
+  sunAltDeg: number,
+  observer: Observer
 ): SatObject[] {
   if (satrecCache.size > records.length * 3 + 64) satrecCache.clear();
+
+  // Derived per call now that the observer varies per request — three trig
+  // conversions, i.e. nothing next to ~160 SGP4 propagations. The satrec
+  // cache above stays shared: an SGP4 record is a property of the TLE alone,
+  // independent of who is watching.
+  const observerGd = {
+    latitude: satellite.degreesToRadians(observer.lat),
+    longitude: satellite.degreesToRadians(observer.lon),
+    height: observer.elevationM / 1000,
+  };
 
   const gmst = satellite.gstime(date);
   const skyIsDark = sunAltDeg <= -6;

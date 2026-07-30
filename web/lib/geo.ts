@@ -3,9 +3,12 @@
  * backend/position_engine.py:_observer_az_alt (initial great-circle bearing,
  * haversine ground distance, atan2 elevation) to preserve parity with the
  * reference implementation.
+ *
+ * The observer is a parameter, not a module constant: the same aircraft is
+ * converted for whichever viewer asked (see lib/observer.ts).
  */
 
-import { OBSERVER } from "./config";
+import type { Observer } from "./observer";
 
 const EARTH_RADIUS_M = 6371000.0;
 const DEG = Math.PI / 180;
@@ -17,11 +20,16 @@ export interface AzAltDist {
   groundM: number; // great-circle ground distance, meters
 }
 
-export function observerAzAlt(lat: number, lon: number, altM: number): AzAltDist {
-  const phi1 = OBSERVER.lat * DEG;
+export function observerAzAlt(
+  observer: Observer,
+  lat: number,
+  lon: number,
+  altM: number
+): AzAltDist {
+  const phi1 = observer.lat * DEG;
   const phi2 = lat * DEG;
-  const dphi = (lat - OBSERVER.lat) * DEG;
-  const dlmb = (lon - OBSERVER.lon) * DEG;
+  const dphi = (lat - observer.lat) * DEG;
+  const dlmb = (lon - observer.lon) * DEG;
 
   // Initial bearing (azimuth), normalized to [0, 360).
   const y = Math.sin(dlmb) * Math.cos(phi2);
@@ -38,7 +46,7 @@ export function observerAzAlt(lat: number, lon: number, altM: number): AzAltDist
   const ground = EARTH_RADIUS_M * c;
 
   // Elevation angle above the observer's horizontal plane.
-  const dh = altM - OBSERVER.elevationM;
+  const dh = altM - observer.elevationM;
   const elevation = Math.atan2(dh, ground) * RAD;
   return { az: bearing, alt: elevation, groundM: ground };
 }

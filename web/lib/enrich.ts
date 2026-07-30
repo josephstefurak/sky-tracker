@@ -38,6 +38,27 @@ const routeCache = new Map<string, Cached<RouteInfo>>(); // key: CALLSIGN
 const aircraftCache = new Map<string, Cached<AircraftInfo>>(); // key: icao24
 const inflight = new Set<string>();
 
+/**
+ * Cap on each cache. Until the observer became per-user these Maps were
+ * self-limiting: the only keys that could ever appear were the airframes and
+ * callsigns passing within 25 nm of one fixed point. The key space is now
+ * wherever viewers point the dome, i.e. worldwide, so an explicit bound
+ * replaces the geography that used to provide one. Generous enough that a real
+ * viewing session never evicts (a busy 25 nm circle holds ~100 aircraft).
+ */
+const ENRICH_CACHE_MAX_ENTRIES = 2_000;
+
+/** Insert, dropping the oldest insertions once past the cap. Map iteration is
+ *  insertion-ordered, so the first keys are the oldest. */
+function remember<T>(cache: Map<string, Cached<T>>, key: string, value: Cached<T>): void {
+  cache.set(key, value);
+  while (cache.size > ENRICH_CACHE_MAX_ENTRIES) {
+    const oldest = cache.keys().next();
+    if (oldest.done) break;
+    cache.delete(oldest.value);
+  }
+}
+
 const CALLSIGN_RE = /^[A-Z0-9]{3,8}$/;
 
 function fresh<T>(entry: Cached<T> | undefined): { value: T } | null {
@@ -80,16 +101,16 @@ async function lookupRoute(callsign: string): Promise<void> {
   try {
     const res = await fetchAdsbdb(`https://api.adsbdb.com/v0/callsign/${callsign}`);
     if (res.kind === "miss") {
-      routeCache.set(callsign, { negative: true, at: Date.now() });
+      remember(routeCache, callsign, { negative: true, at: Date.now() });
       return;
     }
     if (res.kind === "error") return; // transient: retry on a later poll
     const fr = (res.body as { flightroute?: Record<string, any> }).flightroute;
     if (!fr) {
-      routeCache.set(callsign, { negative: true, at: Date.now() });
+      remember(routeCache, callsign, { negative: true, at: Date.now() });
       return;
     }
-    routeCache.set(callsign, {
+    remember(routeCache, callsign, {
       value: {
         origin: fr.origin?.iata_code ?? null,
         destination: fr.destination?.iata_code ?? null,
@@ -109,17 +130,17 @@ async function lookupAircraft(icao24: string): Promise<void> {
   try {
     const res = await fetchAdsbdb(`https://api.adsbdb.com/v0/aircraft/${icao24}`);
     if (res.kind === "miss") {
-      aircraftCache.set(icao24, { negative: true, at: Date.now() });
+      remember(aircraftCache, icao24, { negative: true, at: Date.now() });
       return;
     }
     if (res.kind === "error") return;
     const ac = (res.body as { aircraft?: Record<string, any> }).aircraft;
     if (!ac) {
-      aircraftCache.set(icao24, { negative: true, at: Date.now() });
+      remember(aircraftCache, icao24, { negative: true, at: Date.now() });
       return;
     }
     const aircraftType = [ac.manufacturer, ac.type].filter(Boolean).join(" ").trim() || null;
-    aircraftCache.set(icao24, {
+    remember(aircraftCache, icao24, {
       value: {
         aircraftType,
         operator: ac.registered_owner ?? null,

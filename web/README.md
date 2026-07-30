@@ -5,8 +5,32 @@ Live overhead sky — satellites (Celestrak + SGP4) and aircraft
 dome. One Next.js app: API route + Three.js client, deployable to Vercel
 with zero extra services.
 
-Observer is fixed at lat `41.91734343314767`, lon `-87.63808451349306`,
-elevation 180 m (Chicago) — see `lib/config.ts`.
+## Where it looks up from
+
+The observer is per device, resolved once on load:
+
+1. **URL params** `?lat=&lon=` (plus optional `&elev=`, meters above sea level).
+   These win over everything and are the manual override for testing.
+2. **This device's stored location** from an earlier visit.
+3. **`navigator.geolocation`** — the default path for a new user. Needs a secure
+   context: production is HTTPS, and `localhost` counts for development.
+4. **Chicago** (lat `41.91734343314767`, lon `-87.63808451349306`, elevation
+   180 m) when geolocation is denied, unavailable or times out. Quietly — the
+   footer just says which source is in use.
+
+The resolved location is persisted in `localStorage`, so it is a one-time setup
+per device and a reload never re-prompts. The **◎ LOC** control in the corner
+cluster shows the current source and coordinates, accepts typed coordinates and
+can re-ask the browser — all without a page reload. Displayed times follow the
+resolved location, not the device in the room.
+
+Elevation is assumed to be sea level for a hand-entered location; pass `&elev=`
+if the site is high (e.g. `&elev=1600` for Denver). It only matters below a
+degree — see `../DECISIONS.md` §13.
+
+Aircraft are always queried within a fixed 25 nm radius of the observer.
+Relevant code: `lib/observer.ts` (validation + the fallback), `lib/location.ts`
+(resolution order and persistence), `lib/timezone.ts` (which clock).
 
 ## Run locally
 
@@ -44,9 +68,20 @@ looking-down orientation. Verify the math anytime:
 npx tsx scripts/test-projection.ts
 ```
 
+The per-observer plane cache has its own offline self-test (no network calls —
+it stubs `fetch`, so it is safe to run repeatedly):
+
+```bash
+npx tsx scripts/test-planes-cache.ts
+```
+
 ## Debugging
 
-- `GET /api/sky` — the full JSON snapshot (objects + astro + per-source
-  status with human-readable degradation messages).
-- In the browser console: `skyTracker.stats()`, `skyTracker.tracked`, and
-  `skyTracker.simulate([...])` to inject synthetic objects.
+- `GET /api/sky?lat=40.7128&lon=-74.0060` — the full JSON snapshot (objects +
+  astro + the observer it was computed for + per-source status with
+  human-readable degradation messages). Missing or invalid coordinates fall
+  back to the default observer rather than erroring.
+- In the browser console: `skyTracker.stats()`, `skyTracker.tracked`,
+  `skyTracker.simulate([...])` to inject synthetic objects,
+  `skyTracker.location()` for the observer in use, and
+  `skyTracker.setLocation(lat, lon)` to move it with no reload.
